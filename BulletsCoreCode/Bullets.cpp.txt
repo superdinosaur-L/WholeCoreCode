@@ -1,0 +1,1366 @@
+// Fill out your copyright notice in the Description page of Project Settings.
+
+
+#include "Miscellaneous/ECSBullets.h"
+#include "Components/InstancedStaticMeshComponent.h"
+#include <windows.h>    // SetThreadAffinityMask 等 Windows API
+#include "Miscellaneous/FunctionLibrary.h"
+
+//第三版
+void BulletPool::ExpandSpace()
+{
+	char* HeadSpace = reinterpret_cast<char*>(::operator new[](sizeof(BulletEntity) * 8192));
+	Blocks.Emplace(HeadSpace);
+	for (int32 i = 0; i < 8192; i++)
+	{
+		InsidePtr* Ptr = reinterpret_cast<InsidePtr*>(HeadSpace + i * sizeof(BulletEntity));
+		Ptr->Next = AvailableSpace;
+		AvailableSpace = Ptr;
+	}
+}
+
+BulletEntity* BulletPool::Allocate()
+{
+	if (AvailableSpace == nullptr)
+		ExpandSpace();
+	BulletEntity* ReturnSpace = std::launder(reinterpret_cast<BulletEntity*>(AvailableSpace));
+	AvailableSpace = AvailableSpace->Next;
+	new(ReturnSpace) BulletEntity();
+	return ReturnSpace;
+}
+
+void BulletPool::Reallocate(BulletEntity* GivebackSpace)
+{
+	GivebackSpace->Destroy();
+	InsidePtr* Ptr = reinterpret_cast<InsidePtr*>(GivebackSpace);
+	Ptr->Next = AvailableSpace;
+	AvailableSpace = Ptr;
+}
+
+BulletPool::~BulletPool()
+{
+	for (void* Block : Blocks)
+		::operator delete[] (Block);
+}
+
+
+
+
+void InnerCoroutineForBWC::HandleArray(std::shared_ptr<PollStateForBWC> State)
+{
+#if 1
+	FTimerManager& TimerManager = World->GetTimerManager();
+	//设置定时器
+	TimerManager.SetTimer(State->TimerHandle,
+	[State]()
+	{
+		AsyncTask(ENamedThreads::Type::GameThread, [State]()
+		{
+			if (!State->BulletsComponent)
+				return;
+
+			float NowTime = State->World->GetTimeSeconds();
+			if (NowTime - State->BulletsComponent->LastTimeChangeArrayEffectiveFlag.load() >= State->BulletsComponent->RegularInspectionTime)
+			{
+				if (State->BulletsComponent->LocationX.Num() > State->BulletsComponent->EffectiveIndex.load() + 1)
+				{
+					State->BulletsComponent->ResetAllArraySize(State->BulletsComponent->EffectiveIndex.load() + 1);
+				}
+			}
+			//如果上面的条件不满足,说明在不足RegularInspectionTime的时间里面触发了至少两次协程函数.此时最后一次触发协程函数的操作会确保上面的if成立.
+			//但是不管是什么情况,这里都应该恢复协程执行
+			State->handle.resume();
+		});
+	},
+	//这里加0.1的值,防止上面if里面NowTime - LastTime因为浮点数精度的问题意外小于RegularTime
+	State->BulletsComponent->RegularInspectionTime + 0.1,
+	false
+	);
+#endif
+	
+}
+
+
+void BulletWorldComponent::ReplaceAt(int32 Index, const FVector& SpawnLocation, float SpawnRandomDeviation,
+                                     float MinSpeed, float MaxSpeed)
+{
+	LocationX[Index] = SpawnLocation.X + UKismetMathLibrary::RandomFloatInRange(-SpawnRandomDeviation, SpawnRandomDeviation);
+	LocationY[Index] = SpawnLocation.Y + UKismetMathLibrary::RandomFloatInRange(-SpawnRandomDeviation, SpawnRandomDeviation);
+	LocationZ[Index] = SpawnLocation.Z + UKismetMathLibrary::RandomFloatInRange(-SpawnRandomDeviation, SpawnRandomDeviation);
+	SpeedX[Index] = UKismetMathLibrary::RandomFloatInRange(MinSpeed, MaxSpeed);
+	SpeedY[Index] = UKismetMathLibrary::RandomFloatInRange(MinSpeed, MaxSpeed);
+	SpeedZ[Index] = UKismetMathLibrary::RandomFloatInRange(MinSpeed, MaxSpeed);
+	IndexInBC[Index] = SourceBC->EffectiveIndex.load() + 1 + (Index - EffectiveIndex.load() - 1);
+}
+
+
+void InnerCoroutineForBC::HandleArray(std::shared_ptr<PollStatForBC> State)
+{
+	State->SourceController->LastTimeChangeArrayEffectiveFlag.store(State->World->GetTimeSeconds());
+	FTimerManager& TimerManager = World->GetTimerManager();
+	TimerManager.SetTimer(State->TimerHandle, [State]()
+	{
+		AsyncTask(ENamedThreads::Type::GameThread, [State]()
+		{
+			if (!State->SourceController)
+				return;
+
+			float NowTime = State->World->GetTimeSeconds();
+			if (NowTime - State->SourceController->LastTimeChangeArrayEffectiveFlag.load() >= State->SourceController->RegularInspectionTime.load())
+			{
+				if (State->SourceController->RemainingLifeTime.Num() > (State->SourceController->EffectiveIndex.load() + 1))
+				{
+					State->SourceController->ResetAllArraySize(State->SourceController->EffectiveIndex.load() + 1);
+				}
+			}
+			State->handle.resume();
+		});
+	},
+	State->SourceController->RegularInspectionTime.load() + 0.01,
+	false);
+}
+
+void AHighPerformanceBullets::SetThreeDistances(float _Close, float _Middle, float _Far)
+{
+	Close = _Close;
+	Middle = _Middle;
+	Far = _Far;
+}
+
+void AHighPerformanceBullets::SetUpdateRenderingNum(int32 _MiddleNum, int32 _FarNum)
+{
+	MiddleRenderingNum = _MiddleNum;
+	FarRenderingNum = _FarNum;
+}
+
+void AHighPerformanceBullets::ResetAllArraySize(int32 Size)
+{
+	InstancedStaticMeshIndex.SetNum(Size);
+	Bullets.SetNum(Size);
+	RemainingLifeTime.SetNum(Size);
+	MapToBWC.SetNum(Size);
+}
+
+void AHighPerformanceBullets::SpawnBullets(int32 SpawnNum, FVector& SpawnLocation, float SpawnRandomDeviation, float MinSpeed, float MaxSpeed, float OriginalLifeTime
+	,int32 Level)
+{
+	SpawnNum = SpawnNum > 0 ? SpawnNum : -SpawnNum;
+	RegularHandleArray();
+#if 1
+	int32 ComponentOldEffectIndex = BulletWorldComponent[Level].EffectiveIndex.load();
+	if (EffectiveIndex.load() + 1 + SpawnNum > Bullets.Num())
+		ResetAllArraySize((EffectiveIndex.load() + 1 + SpawnNum) * 5);
+	BulletWorldComponent[Level].AddNewBulletComponent(SpawnNum, SpawnLocation, SpawnRandomDeviation, MinSpeed, MaxSpeed);
+	FTransform SpawnTransform;
+	SpawnTransform.SetScale3D({0.1f, 0.1f, 0.1f});
+	for (int32 i = 0 ; i < SpawnNum ; i++)
+	{
+		Bullets[EffectiveIndex.load() + 1 + i] = BulletPool.Allocate();
+		RemainingLifeTime[EffectiveIndex.load() + 1 + i] = OriginalLifeTime;
+		MapToBWC[EffectiveIndex.load() + 1 + i] = {Level, ComponentOldEffectIndex + 1 + i};
+		SpawnTransform.SetLocation({BulletWorldComponent[Level].LocationX[ComponentOldEffectIndex + 1 + i],
+		BulletWorldComponent[Level].LocationY[ComponentOldEffectIndex + 1 + i],
+		BulletWorldComponent[Level].LocationZ[ComponentOldEffectIndex + 1 + i]});
+		InstancedStaticMeshIndex[EffectiveIndex.load() + 1 + i] = InstancedMesh->AddInstance(SpawnTransform);
+	}
+	EffectiveIndex += SpawnNum;
+#endif
+#if 0
+	BulletWorldComponent[3].AddNewBulletComponent(6, SpawnLocation, SpawnRandomDeviation, MinSpeed, MaxSpeed);
+	ResetAllArraySize(12);
+	RemainingLifeTime[0] = RemainingLifeTime[1] = RemainingLifeTime[2] = 5;
+	RemainingLifeTime[3] = RemainingLifeTime[4] = RemainingLifeTime[5] = 7;
+	RemainingLifeTime[6] = RemainingLifeTime[7] = RemainingLifeTime[8] = 10;
+	RemainingLifeTime[9] = RemainingLifeTime[10] = RemainingLifeTime[11] = 12;
+	EffectiveIndex += 6;
+	BulletWorldComponent[2].AddNewBulletComponent(6, SpawnLocation, SpawnRandomDeviation, MinSpeed, MaxSpeed);
+	EffectiveIndex += 6;
+	MapToBWC[0] = {3, 0}; MapToBWC[1] = {3, 1}; MapToBWC[2] = {3, 2}; MapToBWC[3] = {3, 3}; MapToBWC[4] = {3, 4}; MapToBWC[5] = {3, 5};
+	MapToBWC[6] = {2, 0}; MapToBWC[7] = {2, 1}; MapToBWC[8] = {2, 2}; MapToBWC[9] = {2, 3}; MapToBWC[10] = {2, 4}; MapToBWC[11] = {2, 5};
+	int i = 0;
+	UE_LOG(LogTemp, Error, TEXT("EffectiveIndex: %d"), EffectiveIndex.load())
+	LogAllControlInformation(false, true, true);
+#endif
+}
+
+#if 0
+void AHighPerformanceBullets::HandleDeathElement()
+{
+	LastTimeChangeArrayEffectiveFlag.store(GetWorld()->GetTimeSeconds());
+    
+    for (int32 i =  NeedDeleteMask.Num() -  1 ; i >= 0 ; i--)
+    {
+        if (NeedDeleteMask[i] == 1)
+        {
+	        auto& HandleBWC = BulletWorldComponent[MapToBWC[i].Key];
+        	HandleBWC.LastTimeChangeArrayEffectiveFlag.store(GetWorld()->GetTimeSeconds());
+        	//MapToBWC[i].Value指向应该死亡的BWC的下标
+        	int32 ShouldDieIndex = MapToBWC[i].Value;
+        	Swap(HandleBWC.IndexInBC[ShouldDieIndex], HandleBWC.IndexInBC[HandleBWC.EffectiveIndex.load()]);
+        	int32 NewValidIndex = ShouldDieIndex;
+        	int32 OldErrorIndex = HandleBWC.IndexInBC[NewValidIndex];
+        	MapToBWC[OldErrorIndex].Value = NewValidIndex;
+        	--HandleBWC.EffectiveIndex;
+
+        	if (i != EffectiveIndex.load())
+        	{
+        		Swap(RemainingLifeTime[i], RemainingLifeTime[EffectiveIndex.load()]);
+        		Swap(MapToBWC[i], MapToBWC[EffectiveIndex.load()]);
+        		BulletWorldComponent[MapToBWC[i].Key].IndexInBC[MapToBWC[i].Value] = i;
+        	}
+        	--EffectiveIndex;
+        }
+    	//CheckRankingIsValid();
+    }
+}
+#endif
+
+#if 1
+void AHighPerformanceBullets::HandleDeathElement_Life()
+{
+	LastTimeChangeArrayEffectiveFlag.store(GetWorld()->GetTimeSeconds());
+    TArray<int32> ISMCNeedRemoveIndex;
+    int32 NeedRemoveNum = 0;
+    ISMCNeedRemoveIndex.SetNum(NeedDeleteMask.Num());
+    TArray<int32> DeleteNum;
+    DeleteNum.SetNumZeroed(NeedDeleteMask.Num());
+	TArray<int32> NeedRegularResizeArrayBWC;
+    //无视子弹剩余存活时长的内存排序(因为下面的Swap可能导致乱序),严格按照从0到EffectiveIndex的顺序进行校验,强行创建一个不是对齐数组,但是Index从小到大的强行捋直的ISMCIndex数组
+    {
+        for (int32 i = 0 ; i < NeedDeleteMask.Num() ; i++)
+        {
+            if (NeedDeleteMask[i])
+            {
+                DeleteNum[InstancedStaticMeshIndex[i]] = 1;
+            }
+        }
+        for (int32 i = 1 ; i < DeleteNum.Num() ; i++)
+        {
+            DeleteNum[i] += DeleteNum[i - 1];
+        }
+    }
+    
+    for (int32 i =  NeedDeleteMask.Num() -  1 ; i >= 0 ; i--)
+    {
+        if (NeedDeleteMask[i] == 1)
+        {
+            auto& HandleBWC = BulletWorldComponent[MapToBWC[i].Key];
+            HandleBWC.LastTimeChangeArrayEffectiveFlag.store(GetWorld()->GetTimeSeconds());
+        	NeedRegularResizeArrayBWC.AddUnique(MapToBWC[i].Key);
+        	//MapToBWC[i].Value指向应该死亡的BWC的下标
+        	int32 BWCDeathColumn = MapToBWC[i].Value;
+            Swap(HandleBWC.LocationX[BWCDeathColumn], HandleBWC.LocationX[HandleBWC.EffectiveIndex.load()]);
+            Swap(HandleBWC.LocationY[BWCDeathColumn], HandleBWC.LocationY[HandleBWC.EffectiveIndex.load()]);
+            Swap(HandleBWC.LocationZ[BWCDeathColumn], HandleBWC.LocationZ[HandleBWC.EffectiveIndex.load()]);
+            Swap(HandleBWC.SpeedX[BWCDeathColumn], HandleBWC.SpeedX[HandleBWC.EffectiveIndex.load()]);
+            Swap(HandleBWC.SpeedY[BWCDeathColumn], HandleBWC.SpeedY[HandleBWC.EffectiveIndex.load()]);
+            Swap(HandleBWC.SpeedZ[BWCDeathColumn], HandleBWC.SpeedZ[HandleBWC.EffectiveIndex.load()]);
+        	Swap(HandleBWC.IndexInBC[BWCDeathColumn], HandleBWC.IndexInBC[HandleBWC.EffectiveIndex.load()]);
+            MapToBWC[HandleBWC.IndexInBC[BWCDeathColumn]].Value = BWCDeathColumn;
+            --HandleBWC.EffectiveIndex;
+
+        	if (i != EffectiveIndex.load())
+        	{
+        		Swap(InstancedStaticMeshIndex[i], InstancedStaticMeshIndex[EffectiveIndex.load()]);
+        		Swap(Bullets[i], Bullets[EffectiveIndex.load()]);
+        		Swap(RemainingLifeTime[i], RemainingLifeTime[EffectiveIndex.load()]);
+        		Swap(MapToBWC[i], MapToBWC[EffectiveIndex.load()]);
+        		//如果i == EffectiveIndex.load(),会导致下面的代码覆盖了MapToBWC[HandleBWC.IndexInBC[BWCDeathIndex]].Value = BWCDeathIndex;
+        		//这里是害怕MapToBWC[i]本是无效元素被当作有效元素
+        		BulletWorldComponent[MapToBWC[i].Key].IndexInBC[MapToBWC[i].Value] = i;
+        	}
+        	ISMCNeedRemoveIndex[NeedRemoveNum] = InstancedStaticMeshIndex[EffectiveIndex.load()];
+            BulletPool.Reallocate(Bullets[EffectiveIndex.load()]);
+        	--EffectiveIndex;
+            NeedRemoveNum++;
+            
+            continue ;
+        }
+        InstancedStaticMeshIndex[i] -= DeleteNum[InstancedStaticMeshIndex[i]];
+    	//CheckRankingIsValid();
+    }
+	for (int32 i : NeedRegularResizeArrayBWC)
+		BulletWorldComponent[i].RegularHandleArraySize();
+    RegularHandleArray();
+    ISMCNeedRemoveIndex.SetNum(NeedRemoveNum);
+    InstancedMesh->RemoveInstances(ISMCNeedRemoveIndex);
+}
+#endif
+
+void AHighPerformanceBullets::HandleDeathElement_Generic(TArray<TTuple<int32, TArray<int32>>>& DeathElement, bool UsingSwap)
+{
+	FMemMark Mark(FMemStack::Get());
+	FMemStack& Stack = FMemStack::Get();
+	int32* NeedDeleteIndexValue = reinterpret_cast<int32*>(Stack.Alloc(sizeof(int32) * (EffectiveIndex.load() + 1), 2));
+	FMemory::Memzero(NeedDeleteIndexValue, sizeof(int32) * (EffectiveIndex.load() + 1));
+	NeedDeleteIndexValue[0] = 0;
+	
+	TArray<int32> NeedDeathISMCIndex;
+	NeedDeathISMCIndex.SetNum(EffectiveIndex.load() + 1);
+	int32 DeathNum = 0;
+	
+	for (auto& DeathTuple : DeathElement)
+	{
+		if (DeathTuple.Value.Num() == 0)
+			continue ;
+		auto& BWC = BulletWorldComponent[DeathTuple.Key];
+		auto& DeathIndexes = DeathTuple.Value;
+		BWC.LastTimeChangeArrayEffectiveFlag.store(GetWorld()->GetTimeSeconds());
+		for (int32 i = 0 ; i < DeathIndexes.Num() - 2 ; i++)
+		{
+#if USE_AVX2
+			_mm_prefetch((char const*)&InstancedStaticMeshIndex[BWC.IndexInBC[DeathIndexes[i + 2]]], _MM_HINT_T1);
+#endif
+			NeedDeleteIndexValue[InstancedStaticMeshIndex[BWC.IndexInBC[DeathIndexes[i]]]] = 1;
+		}
+		if (DeathIndexes.Num() >= 2)
+			NeedDeleteIndexValue[InstancedStaticMeshIndex[BWC.IndexInBC[DeathIndexes[DeathIndexes.Num() - 2]]]] = 1;
+		NeedDeleteIndexValue[InstancedStaticMeshIndex[BWC.IndexInBC[DeathIndexes[DeathIndexes.Num() - 1]]]] = 1;
+	}
+	for (int32 i = 1 ; i <= EffectiveIndex.load() ; ++i)
+		NeedDeleteIndexValue[i] += NeedDeleteIndexValue[i - 1];
+	//上面完成对Index的处理,下面开始处理BWC
+	
+	for (auto& DeathTuple : DeathElement)
+	{
+		if (DeathTuple.Value.Num() == 0)
+			continue ;
+		auto& BWC = BulletWorldComponent[DeathTuple.Key];
+		auto& DeathIndexes = DeathTuple.Value;
+		Algo::Sort(DeathIndexes, [](int32 a, int32 b){return a > b;});
+		for (int32 ColumnIndex : DeathIndexes)
+		{
+			//LogAllControlInformation(false, true, false);
+			//UE_LOG(LogTemp, Error, TEXT("ColumnIndex : %d"), ColumnIndex)
+			int32 BCDeathColumn = BWC.IndexInBC[ColumnIndex];
+			NeedDeathISMCIndex[DeathNum] = InstancedStaticMeshIndex[BCDeathColumn];
+			DeathNum++;
+			//处理BC
+			{
+				Swap(Bullets[BCDeathColumn], Bullets[EffectiveIndex.load()]);
+				BulletPool.Reallocate(Bullets[EffectiveIndex.load()]);
+				if (UsingSwap)
+				{
+					Swap(RemainingLifeTime[BCDeathColumn], RemainingLifeTime[EffectiveIndex.load()]);
+					Swap(MapToBWC[BCDeathColumn], MapToBWC[EffectiveIndex.load()]);
+					Swap(InstancedStaticMeshIndex[BCDeathColumn], InstancedStaticMeshIndex[EffectiveIndex.load()]);
+				}
+				else
+				{
+					RemainingLifeTime[BCDeathColumn] = RemainingLifeTime[EffectiveIndex.load()];
+					MapToBWC[BCDeathColumn] = MapToBWC[EffectiveIndex.load()];
+					InstancedStaticMeshIndex[BCDeathColumn] = InstancedStaticMeshIndex[EffectiveIndex.load()];
+				}
+				--EffectiveIndex;
+			}
+			BulletWorldComponent[MapToBWC[BCDeathColumn].Key].IndexInBC[MapToBWC[BCDeathColumn].Value] = BCDeathColumn;
+			if (ColumnIndex == BWC.EffectiveIndex.load())
+			{
+				--BWC.EffectiveIndex;
+				//CheckRankingIsValid();
+				//EMPTY_LOG()
+				continue;
+			}
+			//处理BWC
+			{
+				if (UsingSwap)
+				{
+					Swap(BWC.LocationX[ColumnIndex], BWC.LocationX[BWC.EffectiveIndex.load()]);
+					Swap(BWC.LocationY[ColumnIndex], BWC.LocationY[BWC.EffectiveIndex.load()]);
+					Swap(BWC.LocationZ[ColumnIndex], BWC.LocationZ[BWC.EffectiveIndex.load()]);
+					Swap(BWC.SpeedX[ColumnIndex], BWC.SpeedX[BWC.EffectiveIndex.load()]);
+					Swap(BWC.SpeedY[ColumnIndex], BWC.SpeedY[BWC.EffectiveIndex.load()]);
+					Swap(BWC.SpeedZ[ColumnIndex], BWC.SpeedZ[BWC.EffectiveIndex.load()]);
+					Swap(BWC.IndexInBC[ColumnIndex], BWC.IndexInBC[BWC.EffectiveIndex.load()]);
+				}
+				else
+				{
+					BWC.LocationX[ColumnIndex] = BWC.LocationX[BWC.EffectiveIndex.load()];
+					BWC.LocationY[ColumnIndex] = BWC.LocationY[BWC.EffectiveIndex.load()];
+					BWC.LocationZ[ColumnIndex] = BWC.LocationZ[BWC.EffectiveIndex.load()];
+					BWC.SpeedX[ColumnIndex] = BWC.SpeedX[BWC.EffectiveIndex.load()];
+					BWC.SpeedY[ColumnIndex] = BWC.SpeedY[BWC.EffectiveIndex.load()];
+					BWC.SpeedZ[ColumnIndex] = BWC.SpeedZ[BWC.EffectiveIndex.load()];
+					BWC.IndexInBC[ColumnIndex] = BWC.IndexInBC[BWC.EffectiveIndex.load()];
+				}
+				MapToBWC[BWC.IndexInBC[ColumnIndex]].Value = ColumnIndex;
+				--BWC.EffectiveIndex;
+			}
+			//CheckRankingIsValid();
+			//EMPTY_LOG()
+		}
+	}
+	//LogAllControlInformation(false, true, false);
+	//EMPTY_LOG()
+	NeedDeathISMCIndex.SetNum(DeathNum);
+	for (int32 i : NeedDeathISMCIndex)
+		UE_LOG(LogTemp, Error, TEXT("DeathIndex: %d"), i)
+	InstancedMesh->RemoveInstances(NeedDeathISMCIndex);
+	for (int32 i = 0 ; i <= EffectiveIndex.load() ; ++i)
+	{
+		InstancedStaticMeshIndex[i] -= NeedDeleteIndexValue[InstancedStaticMeshIndex[i]];
+	}
+	for (auto& DeathTuple : DeathElement)
+		BulletWorldComponent[DeathTuple.Key].RegularHandleArraySize();
+	//CheckInstancedIndexIsValid();
+}
+
+void AHighPerformanceBullets::CountRemainingLifeTime()
+{
+	if (EffectiveIndex.load() == -1 || CountingMultipleThreads.Num() == 0)
+		return ;
+	//不要使用虚幻的ParallelFor了.分配逻辑完全不适配我的AVX2需求
+
+	//寻找第一个能被64整除的地址
+	auto[aligned_ptr, remaining_bytes] = UFunctionLibrary::find_first_aligned<float>(&RemainingLifeTime[0], EffectiveIndex.load() + 1);
+	int32 CacheAlignedNum = remaining_bytes / sizeof(float);
+	//需要被处理的组的数量
+	int32 GroupNum = CacheAlignedNum / 8;
+	//每个核心独占FMA端口进行运算，这是最大可同时分配的线程数量.这里我的cpu核心数是12
+	int32 NumOfCores = FPlatformMisc::NumberOfCores();
+	//每个缓存行可以处理的组的数量.每八个为一组,这里可以处理2组且一个缓存行刚好没有剩余空闲
+	int32 PerCacheLineCouldHandleGroup = std::hardware_destructive_interference_size / sizeof(float) / 8;
+	//每个线程至少处理1缓存行的数据,否则可能省的时间还不如多线程的唤醒开销
+	int32 MinimumNumberOfGroups = NumOfCores * PerCacheLineCouldHandleGroup * 1;
+	NeedDeleteMask.SetNum(EffectiveIndex.load() + 1);
+	HasNewDeathElement.store(false);
+	//单线程处理
+	if (GroupNum < MinimumNumberOfGroups)
+	{
+#if USE_AVX2
+		if (aligned_ptr == nullptr)
+		{
+			for (int32 i = 0; i < EffectiveIndex.load() + 1; i++)
+			{
+				RemainingLifeTime[i] -= DeltaTime.load();
+				NeedDeleteMask[i] = RemainingLifeTime[i] <= 0 ? (HasNewDeathElement.store(true), 1) : 0;
+			}
+			if (HasNewDeathElement.load())
+				HandleDeathElement_Life();
+			return ;
+		}
+		int32 UnalignedPrefix = (EffectiveIndex.load() + 1) - CacheAlignedNum;
+		for (int32 i = 0; i < UnalignedPrefix; i++)
+		{
+			RemainingLifeTime[i] -= DeltaTime.load();
+			NeedDeleteMask[i] = RemainingLifeTime[i] <= 0 ? (HasNewDeathElement.store(true), 1) : 0;
+		}
+		
+		int32 AlignedStart = UnalignedPrefix;  // = 3
+		int32 AlignedEnd = (CacheAlignedNum / 8) * 8 + AlignedStart;  // 30*8 + 3 = 243
+    
+		for (int32 i = AlignedStart; i + 8 <= AlignedEnd; i += 8)
+		{
+			__m256 Life = _mm256_load_ps(&RemainingLifeTime[i]);  
+			__m256 Zero = _mm256_setzero_ps();
+			__m256 DeleteLife = _mm256_set1_ps(DeltaTime.load());
+			Life = _mm256_sub_ps(Life, DeleteLife);
+			_mm256_store_ps(&RemainingLifeTime[i], Life);
+
+			int32 Mask = _mm256_movemask_ps(_mm256_cmp_ps(Life, Zero, _CMP_LE_OS));
+			for (int32 j = 0; j < 8; j++)
+			{
+				NeedDeleteMask[i + j] = Mask & (1 << j) ? (HasNewDeathElement.store(true), 1) : 0;
+			}
+		}
+		
+		for (int32 i = AlignedEnd; i < EffectiveIndex.load() + 1; i++)
+		{
+			RemainingLifeTime[i] -= DeltaTime.load();
+			NeedDeleteMask[i] = RemainingLifeTime[i] <= 0 ? (HasNewDeathElement.store(true), 1) : 0;
+		}
+		//CheckRankingIsValid();
+		if (HasNewDeathElement.load())
+			HandleDeathElement_Life();
+		return;
+#endif
+	}
+#if USE_AVX2
+	UE_LOG(LogTemp, Error, TEXT("MultiThreading:CountLife"))
+	EMPTY_LOG()
+	int32 TotalNumOfCacheLine = GroupNum / PerCacheLineCouldHandleGroup;
+	int32 PerCoreHandleCacheNum = TotalNumOfCacheLine / NumOfCores;
+	int32 StartIndex = PerCoreHandleCacheNum * PerCacheLineCouldHandleGroup * 8 + (EffectiveIndex.load() + 1 - CacheAlignedNum);
+	CountLifeHelper[0] = {0, StartIndex};
+	for (int32 i = 1 ; i < (FPlatformMisc::NumberOfCores() - 1) ; i++)
+	{
+		int32 NeedHandleFloatNum = PerCoreHandleCacheNum * PerCacheLineCouldHandleGroup * 8;
+		CountLifeHelper[i] = {StartIndex, NeedHandleFloatNum};
+		StartIndex += NeedHandleFloatNum;
+	}
+	CountLifeHelper[FPlatformMisc::NumberOfCores() - 1] = {
+		StartIndex,
+		EffectiveIndex.load() - StartIndex + 1
+	};
+	
+	MultithreadingTaskToDo = ECountRemainingLifeTime;
+	BeginWaitingTaskNum.store(0);
+	FinishTaskNum.store(0);
+	NeedMultithreadingHandleTask.store(true);
+	RunMultithreadingCV.notify_all();
+	{
+		std::unique_lock<std::mutex> Lock(FinishCountLifeMutexLock);
+		FinishCountLifeCV.wait(Lock, [this](){return FinishTaskNum.load() == (FPlatformMisc::NumberOfCores());});
+	}
+	//CheckRankingIsValid();
+	if (HasNewDeathElement.load())
+		HandleDeathElement_Life();
+#endif
+}
+
+void AHighPerformanceBullets::CountBulletsLocationAndLevel()
+{
+	if (!IsValid(OriginLocationTarget))
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Turquoise, TEXT("HighPerformanceBullets::OriginLocationTarget Is Null."));
+		UE_LOG(LogTemp, Error, TEXT("HighPerformanceBullets::OriginLocationTarget."));
+		EMPTY_LOG();
+		return ;
+	}
+	if (EffectiveIndex.load() == -1 || CountingMultipleThreads.Num() == 0)
+		return;
+	const FVector& OriginLocation = OriginLocationTarget->GetActorLocation();
+	//我希望把位置计算和Level更新的任务也提交到多线程
+	auto[_aligned_ptr, _remaining_bytes] = UFunctionLibrary::find_first_aligned(&RemainingLifeTime[0], EffectiveIndex.load() + 1);
+	int32 AlignedNum = _remaining_bytes / sizeof(float);
+	int32 GroupNum = AlignedNum / 8;
+	//每个核心独占FMA端口进行运算，这是最大可同时分配的线程数量.这里我的cpu核心数是12
+	int32 NumOfCores = FPlatformMisc::NumberOfCores();
+	//每个缓存行可以处理的组的数量.每八个为一组,这里可以处理2组且一个缓存行刚好没有剩余空闲
+	int32 PerCacheLineCouldHandleGroup = std::hardware_constructive_interference_size / sizeof(float) / 8;
+	//每个线程至少处理1缓存行的数据,否则可能省的时间还不如多线程的唤醒开销
+	int32 MinimumNumberOfGroups = NumOfCores * PerCacheLineCouldHandleGroup * 1;
+
+	__m256 TargetLocationX = _mm256_set1_ps(OriginLocation.X);
+	__m256 TargetLocationY = _mm256_set1_ps(OriginLocation.Y);
+	__m256 TargetLocationZ = _mm256_set1_ps(OriginLocation.Z);
+	TArray<int32> NeedRegularResizeArray;
+	int32 OldEffectiveIndexSet[4] = {
+		BulletWorldComponent[0].EffectiveIndex.load(),
+		BulletWorldComponent[1].EffectiveIndex.load(),
+		BulletWorldComponent[2].EffectiveIndex.load(),
+		BulletWorldComponent[3].EffectiveIndex.load()
+	};
+	//单线程处理
+	if (GroupNum < MinimumNumberOfGroups)
+	{
+		auto f = [=, this, &NeedRegularResizeArray](int32 Level)
+		{
+			auto& BWC = BulletWorldComponent[Level];
+			int32 OldEffective = OldEffectiveIndexSet[Level];
+			TArray<int32> NewLevel;
+			NewLevel.SetNum(OldEffective + 1);
+			for (int32 i = 0 ; i + 8 <= OldEffective + 1 ; i += 8)
+			{
+				if (i + PerCacheLineCouldHandleGroup * 8 < OldEffective + 1 && i % (PerCacheLineCouldHandleGroup * 8) == 0)
+				{
+					_mm_prefetch((const char*)&BWC.LocationX[i + PerCacheLineCouldHandleGroup * 8], _MM_HINT_T0);
+					_mm_prefetch((const char*)&BWC.LocationY[i + PerCacheLineCouldHandleGroup * 8], _MM_HINT_T0);
+					_mm_prefetch((const char*)&BWC.LocationZ[i + PerCacheLineCouldHandleGroup * 8], _MM_HINT_T0);
+					_mm_prefetch((const char*)&BWC.SpeedX[i + PerCacheLineCouldHandleGroup * 8], _MM_HINT_T0);
+					_mm_prefetch((const char*)&BWC.SpeedY[i + PerCacheLineCouldHandleGroup * 8], _MM_HINT_T0);
+					_mm_prefetch((const char*)&BWC.SpeedZ[i + PerCacheLineCouldHandleGroup * 8], _MM_HINT_T0);
+				}
+				//更新位置
+				__m256 LX = _mm256_loadu_ps(&BWC.LocationX[i]);
+				__m256 LY = _mm256_loadu_ps(&BWC.LocationY[i]);
+				__m256 LZ = _mm256_loadu_ps(&BWC.LocationZ[i]);
+
+				__m256 SX = _mm256_loadu_ps(&BWC.SpeedX[i]);
+				__m256 SY = _mm256_loadu_ps(&BWC.SpeedY[i]);
+				__m256 SZ = _mm256_loadu_ps(&BWC.SpeedZ[i]);
+
+				__m256 Time = _mm256_set1_ps(DeltaTime.load());
+				LX = _mm256_fmadd_ps(Time, SX, LX);
+				LY = _mm256_fmadd_ps(Time, SY, LY);
+				LZ = _mm256_fmadd_ps(Time, SZ, LZ);
+				_mm256_storeu_ps(&BWC.LocationX[i], LX);
+				_mm256_storeu_ps(&BWC.LocationY[i], LY);
+				_mm256_storeu_ps(&BWC.LocationZ[i], LZ);
+				
+				//计算距离和Level
+				__m256 DX = _mm256_sub_ps(LX, TargetLocationX);
+				__m256 DY = _mm256_sub_ps(LY, TargetLocationY);
+				__m256 DZ = _mm256_sub_ps(LZ, TargetLocationZ);
+
+				__m256 DisSquare = _mm256_fmadd_ps(DX, DX, _mm256_fmadd_ps(DY, DY, _mm256_mul_ps(DZ, DZ)));
+				alignas(std::hardware_destructive_interference_size) float Dis[8];
+				_mm256_store_ps(Dis, DisSquare);
+
+				for (int32 j = 0 ; j < 8 ; j++)
+				{
+					NewLevel[i + j] = GetLevelByDisSquare(Dis[j]);
+				}
+			}
+			int32 Index = (OldEffective + 1) / 8 * 8;
+			for (; Index < OldEffective + 1; Index++)
+			{
+				BWC.LocationX[Index] += BWC.SpeedX[Index] * DeltaTime.load();
+				BWC.LocationY[Index] += BWC.SpeedY[Index] * DeltaTime.load();
+				BWC.LocationZ[Index] += BWC.SpeedZ[Index] * DeltaTime.load();
+				float DisSquare = (BWC.LocationX[Index] - OriginLocationTarget->GetActorLocation().X) * (BWC.LocationX[Index] - OriginLocationTarget->GetActorLocation().X)
+				+ (BWC.LocationY[Index] - OriginLocationTarget->GetActorLocation().Y) * (BWC.LocationY[Index] - OriginLocationTarget->GetActorLocation().Y)
+				+ (BWC.LocationZ[Index] - OriginLocationTarget->GetActorLocation().Z) * (BWC.LocationZ[Index] - OriginLocationTarget->GetActorLocation().Z);
+				NewLevel[Index] = GetLevelByDisSquare(DisSquare);
+			}
+			//上面处理LocationX, LocationY, LocationZ的更新并且根据Close, Mid, Far, Limit计算出新的层级
+			for (int32 i = OldEffective ; i >= 0 ; i--)
+			{
+				if (NewLevel[i] == Level)
+					continue ;
+
+				auto& InsertTarget = BulletWorldComponent[NewLevel[i]];
+				InsertTarget.LastTimeChangeArrayEffectiveFlag.store(GetWorld()->GetTimeSeconds());
+				NeedRegularResizeArray.AddUnique(NewLevel[i]);
+				if ((InsertTarget.EffectiveIndex.load() + 1) < InsertTarget.LocationX.Num())
+				{
+					InsertTarget.LocationX[InsertTarget.EffectiveIndex.load() + 1] = BWC.LocationX[i];
+					InsertTarget.LocationY[InsertTarget.EffectiveIndex.load() + 1] = BWC.LocationY[i];
+					InsertTarget.LocationZ[InsertTarget.EffectiveIndex.load() + 1] = BWC.LocationZ[i];
+					InsertTarget.SpeedX[InsertTarget.EffectiveIndex.load() + 1] = BWC.SpeedX[i];
+					InsertTarget.SpeedY[InsertTarget.EffectiveIndex.load() + 1] = BWC.SpeedY[i];
+					InsertTarget.SpeedZ[InsertTarget.EffectiveIndex.load() + 1] = BWC.SpeedZ[i];
+					InsertTarget.IndexInBC[InsertTarget.EffectiveIndex.load() + 1] = BWC.IndexInBC[i];
+					MapToBWC[InsertTarget.IndexInBC[InsertTarget.EffectiveIndex.load() + 1]] = {NewLevel[i], InsertTarget.EffectiveIndex.load() + 1};
+					++InsertTarget.EffectiveIndex;
+				}
+				else
+				{
+					InsertTarget.LocationX.Emplace(BWC.LocationX[i]);
+					InsertTarget.LocationY.Emplace(BWC.LocationY[i]);
+					InsertTarget.LocationZ.Emplace(BWC.LocationZ[i]);
+					InsertTarget.SpeedX.Emplace(BWC.SpeedX[i]);
+					InsertTarget.SpeedY.Emplace(BWC.SpeedY[i]);
+					InsertTarget.SpeedZ.Emplace(BWC.SpeedZ[i]);
+					InsertTarget.IndexInBC.Emplace(BWC.IndexInBC[i]);
+					++InsertTarget.EffectiveIndex;
+					MapToBWC[InsertTarget.IndexInBC[InsertTarget.EffectiveIndex.load()]] = {NewLevel[i], InsertTarget.EffectiveIndex.load()};
+				}
+
+				if (i == BWC.EffectiveIndex.load())
+				{
+					--BWC.EffectiveIndex;
+					continue ;
+				}
+				BWC.LocationX[i] = BWC.LocationX[BWC.EffectiveIndex.load()];
+				BWC.LocationY[i] = BWC.LocationY[BWC.EffectiveIndex.load()];
+				BWC.LocationZ[i] = BWC.LocationZ[BWC.EffectiveIndex.load()];
+				BWC.SpeedX[i] = BWC.SpeedX[BWC.EffectiveIndex.load()];
+				BWC.SpeedY[i] = BWC.SpeedY[BWC.EffectiveIndex.load()];
+				BWC.SpeedZ[i] = BWC.SpeedZ[BWC.EffectiveIndex.load()];
+				BWC.IndexInBC[i] = BWC.IndexInBC[BWC.EffectiveIndex.load()];
+				MapToBWC[BWC.IndexInBC[i]].Value = i;
+				--BWC.EffectiveIndex;
+			}
+		};
+		for (int32 i = 0 ; i < BulletWorldComponent.Num() ; i++)
+			f(i);
+		if (!DrawResidue)
+		{
+			TArray<TTuple<int32, TArray<int32>>> DeathElement;
+			DeathElement.SetNum(BulletWorldComponent.Num());
+			for (int32 i = 0 ; i < DeathElement.Num() - 1 ; i++)
+			{
+				DeathElement[i].Key = i;
+			}
+			DeathElement[DeathElement.Num() - 1].Key = DeathElement.Num() - 1;
+			DeathElement[DeathElement.Num() - 1].Value =
+				UFunctionLibrary::Range<int32>(BulletWorldComponent[BulletWorldComponent.Num() - 1].EffectiveIndex.load() + 1, false);
+			HandleDeathElement_Generic(DeathElement);
+			return ;
+		}
+		for (int32 i : NeedRegularResizeArray)
+			BulletWorldComponent[i].RegularHandleArraySize();
+		return ;
+	}
+
+#if USE_AVX2
+	//多线程处理
+	UE_LOG(LogTemp, Error, TEXT("MultiThreading:CountLevel"))
+	EMPTY_LOG()
+	MultithreadingTaskToDo = ECountBulletsLocationAndLevel;
+	BeginWaitingTaskNum.store(0);
+	FinishTaskNum.store(0);
+	NeedMultithreadingHandleTask.store(true);
+	RunMultithreadingCV.notify_all();
+	{
+		std::unique_lock<std::mutex> Lock(FinishCountLocationMutexLock);
+		FinishCountLocationAndLevelCV.wait(Lock, [this]()
+			{return FinishTaskNum.load() == FPlatformMisc::NumberOfCores();});
+	}
+	auto f = [this, &NeedRegularResizeArray, &OldEffectiveIndexSet](int32 i)
+	{
+		auto& BWC = BulletWorldComponent[i];
+		auto& Level = NewLevel[i];
+		for (int32 j = OldEffectiveIndexSet[i] ; j >= 0 ; --j)
+		{
+			int32 NewLevelIndex = Level[j];
+			
+			if (Level[j] == i)
+				continue ;
+
+			NeedRegularResizeArray.AddUnique(NewLevelIndex);
+			auto& InsertTo = BulletWorldComponent[NewLevelIndex];
+			InsertTo.LastTimeChangeArrayEffectiveFlag.store(GetWorld()->GetTimeSeconds());
+			if (j == BWC.EffectiveIndex.load())
+			{
+				if (InsertTo.EffectiveIndex.load() + 1 < InsertTo.IndexInBC.Num())
+				{
+					InsertTo.LocationX[InsertTo.EffectiveIndex.load() + 1] = BWC.LocationX[j];
+					InsertTo.LocationY[InsertTo.EffectiveIndex.load() + 1] = BWC.LocationY[j];
+					InsertTo.LocationZ[InsertTo.EffectiveIndex.load() + 1] = BWC.LocationZ[j];
+					InsertTo.SpeedX[InsertTo.EffectiveIndex.load() + 1] = BWC.SpeedX[j];
+					InsertTo.SpeedY[InsertTo.EffectiveIndex.load() + 1] = BWC.SpeedY[j];
+					InsertTo.SpeedZ[InsertTo.EffectiveIndex.load() + 1] = BWC.SpeedZ[j];
+					InsertTo.IndexInBC[InsertTo.EffectiveIndex.load() + 1] = BWC.IndexInBC[j];
+					MapToBWC[BWC.IndexInBC[j]] = {NewLevelIndex, InsertTo.EffectiveIndex.load() + 1};
+					++InsertTo.EffectiveIndex;
+				}
+				else
+				{
+					InsertTo.LocationX.Emplace(BWC.LocationX[j]);
+					InsertTo.LocationY.Emplace(BWC.LocationY[j]);
+					InsertTo.LocationZ.Emplace(BWC.LocationZ[j]);
+					InsertTo.SpeedX.Emplace(BWC.SpeedX[j]);
+					InsertTo.SpeedY.Emplace(BWC.SpeedY[j]);
+					InsertTo.SpeedZ.Emplace(BWC.SpeedZ[j]);
+					InsertTo.IndexInBC.Emplace(BWC.IndexInBC[j]);
+					MapToBWC[BWC.IndexInBC[j]] = {NewLevelIndex, InsertTo.EffectiveIndex.load() + 1};
+					++InsertTo.EffectiveIndex;
+				}
+				--BWC.EffectiveIndex;
+				continue ;
+			}
+			// j != BWC.EffectiveIndex.load()
+			if (InsertTo.EffectiveIndex.load() + 1 < InsertTo.IndexInBC.Num())
+			{
+				InsertTo.LocationX[InsertTo.EffectiveIndex.load() + 1] = BWC.LocationX[j];
+				InsertTo.LocationY[InsertTo.EffectiveIndex.load() + 1] = BWC.LocationY[j];
+				InsertTo.LocationZ[InsertTo.EffectiveIndex.load() + 1] = BWC.LocationZ[j];
+				InsertTo.SpeedX[InsertTo.EffectiveIndex.load() + 1] = BWC.SpeedX[j];
+				InsertTo.SpeedY[InsertTo.EffectiveIndex.load() + 1] = BWC.SpeedY[j];
+				InsertTo.SpeedZ[InsertTo.EffectiveIndex.load() + 1] = BWC.SpeedZ[j];
+				InsertTo.IndexInBC[InsertTo.EffectiveIndex.load() + 1] = BWC.IndexInBC[j];
+				MapToBWC[BWC.IndexInBC[j]] = {NewLevelIndex, InsertTo.EffectiveIndex.load() + 1};
+				++InsertTo.EffectiveIndex;
+			}
+			else
+			{
+				InsertTo.LocationX.Emplace(BWC.LocationX[j]);
+				InsertTo.LocationY.Emplace(BWC.LocationY[j]);
+				InsertTo.LocationZ.Emplace(BWC.LocationZ[j]);
+				InsertTo.SpeedX.Emplace(BWC.SpeedX[j]);
+				InsertTo.SpeedY.Emplace(BWC.SpeedY[j]);
+				InsertTo.SpeedZ.Emplace(BWC.SpeedZ[j]);
+				InsertTo.IndexInBC.Emplace(BWC.IndexInBC[j]);
+				MapToBWC[BWC.IndexInBC[j]] = {NewLevelIndex, InsertTo.EffectiveIndex.load() + 1};
+				++InsertTo.EffectiveIndex;
+			}
+			BWC.LocationX[j] = BWC.LocationX[BWC.EffectiveIndex.load()];
+			BWC.LocationY[j] = BWC.LocationY[BWC.EffectiveIndex.load()];
+			BWC.LocationZ[j] = BWC.LocationZ[BWC.EffectiveIndex.load()];
+			BWC.SpeedX[j] = BWC.SpeedX[BWC.EffectiveIndex.load()];
+			BWC.SpeedY[j] = BWC.SpeedY[BWC.EffectiveIndex.load()];
+			BWC.SpeedZ[j] = BWC.SpeedZ[BWC.EffectiveIndex.load()];
+			BWC.IndexInBC[j] = BWC.IndexInBC[BWC.EffectiveIndex.load()];
+			MapToBWC[BWC.IndexInBC[j]].Value = j;
+			--BWC.EffectiveIndex;
+		}
+	};
+	for (int32 i = 0 ; i < BulletWorldComponent.Num() ; i++)
+		f(i);
+	if (!DrawResidue)
+	{
+		TArray<TTuple<int32, TArray<int32>>> DeathElement;
+		DeathElement.SetNum(BulletWorldComponent.Num());
+		for (int32 i = 0 ; i < DeathElement.Num() - 1 ; i++)
+		{
+			DeathElement[i].Key = i;
+		}
+		DeathElement[DeathElement.Num() - 1].Key = DeathElement.Num() - 1;
+		DeathElement[DeathElement.Num() - 1].Value =
+			UFunctionLibrary::Range<int32>(BulletWorldComponent[BulletWorldComponent.Num() - 1].EffectiveIndex.load() + 1, false);
+		HandleDeathElement_Generic(DeathElement);
+		return ;
+	}
+	for (int32 i : NeedRegularResizeArray)
+		BulletWorldComponent[i].RegularHandleArraySize();
+#endif
+}
+
+void AHighPerformanceBullets::UpdateBulletsRendering()
+{
+	if (EffectiveIndex.load() == -1 || BulletWorldComponent.Num() == 0)
+		return ;
+	FTransform NewTransform;
+	NewTransform.SetScale3D({0.1, 0.1, 0.1});
+	if (BulletWorldComponent[0].EffectiveIndex.load() != -1)
+	{
+		for (int32 i = 0 ; i < BulletWorldComponent[0].EffectiveIndex.load() ; i++)
+		{
+#if USE_AVX2
+			_mm_prefetch((char*)&InstancedStaticMeshIndex[BulletWorldComponent[0].IndexInBC[i + 1]], _MM_HINT_T0);
+#endif
+			NewTransform.SetLocation({BulletWorldComponent[0].LocationX[i],
+											   BulletWorldComponent[0].LocationY[i],
+											   BulletWorldComponent[0].LocationZ[i]});
+			InstancedMesh->UpdateInstanceTransform(InstancedStaticMeshIndex[BulletWorldComponent[0].IndexInBC[i]], NewTransform);
+		}
+		NewTransform.SetLocation({BulletWorldComponent[0].LocationX[BulletWorldComponent[0].EffectiveIndex.load()],
+										   BulletWorldComponent[0].LocationY[BulletWorldComponent[0].EffectiveIndex.load()],
+										   BulletWorldComponent[0].LocationZ[BulletWorldComponent[0].EffectiveIndex.load()]});
+		InstancedMesh->UpdateInstanceTransform(InstancedStaticMeshIndex[BulletWorldComponent[0].IndexInBC[BulletWorldComponent[0].EffectiveIndex.load()]], NewTransform);
+	}
+
+	if (BulletWorldComponent[1].EffectiveIndex.load() != -1)
+	{
+		int32 HasRenderNum = 0;
+		if (MiddleRenderingIndex >= BulletWorldComponent[1].EffectiveIndex.load())
+			MiddleRenderingIndex = 0;
+		for (; MiddleRenderingIndex < BulletWorldComponent[1].EffectiveIndex.load() && HasRenderNum <= MiddleRenderingNum; ++MiddleRenderingIndex, HasRenderNum++)
+		{
+#if USE_AVX2
+			_mm_prefetch((char const*)&InstancedStaticMeshIndex[BulletWorldComponent[1].IndexInBC[MiddleRenderingIndex + 1]], _MM_HINT_T0);
+#endif
+			NewTransform.SetLocation({BulletWorldComponent[1].LocationX[MiddleRenderingIndex],
+											   BulletWorldComponent[1].LocationY[MiddleRenderingIndex],
+											   BulletWorldComponent[1].LocationZ[MiddleRenderingIndex]});
+			InstancedMesh->UpdateInstanceTransform(InstancedStaticMeshIndex[BulletWorldComponent[1].IndexInBC[MiddleRenderingIndex]], NewTransform);
+		}
+		if (MiddleRenderingIndex == BulletWorldComponent[1].EffectiveIndex.load())
+		{
+			NewTransform.SetLocation({BulletWorldComponent[1].LocationX[MiddleRenderingIndex],
+											   BulletWorldComponent[1].LocationY[MiddleRenderingIndex],
+											   BulletWorldComponent[1].LocationZ[MiddleRenderingIndex]});
+			InstancedMesh->UpdateInstanceTransform(InstancedStaticMeshIndex[BulletWorldComponent[1].IndexInBC[MiddleRenderingIndex]], NewTransform);
+		}
+	}
+
+	if (BulletWorldComponent[2].EffectiveIndex.load() != -1)
+	{
+		int32 HasRenderNum = 0;
+		if (FarRenderingIndex >= BulletWorldComponent[2].EffectiveIndex.load())
+			FarRenderingIndex = 0;
+		for (; FarRenderingIndex < BulletWorldComponent[2].EffectiveIndex.load() && HasRenderNum <= FarRenderingNum; ++FarRenderingIndex,++HasRenderNum)
+		{
+#if USE_AVX2
+			_mm_prefetch((char const*)&InstancedStaticMeshIndex[BulletWorldComponent[2].IndexInBC[FarRenderingIndex + 1]], _MM_HINT_T0);
+#endif
+			NewTransform.SetLocation({BulletWorldComponent[2].LocationX[FarRenderingIndex],
+											   BulletWorldComponent[2].LocationY[FarRenderingIndex],
+											   BulletWorldComponent[2].LocationZ[FarRenderingIndex]});
+			InstancedMesh->UpdateInstanceTransform(InstancedStaticMeshIndex[BulletWorldComponent[2].IndexInBC[FarRenderingIndex]], NewTransform);
+		}
+		if (FarRenderingIndex == BulletWorldComponent[2].EffectiveIndex.load())
+		{
+			NewTransform.SetLocation({BulletWorldComponent[2].LocationX[FarRenderingIndex],
+											   BulletWorldComponent[2].LocationY[FarRenderingIndex],
+											   BulletWorldComponent[2].LocationZ[FarRenderingIndex]});
+			InstancedMesh->UpdateInstanceTransform(InstancedStaticMeshIndex[BulletWorldComponent[2].IndexInBC[FarRenderingIndex]], NewTransform);
+		}
+	}
+	InstancedMesh->MarkRenderStateDirty();
+	//超过Far的直接不进行渲染更新
+}
+
+void AHighPerformanceBullets::HandleAnyBulletTaskForThread(int32 core_mask_id)
+{
+	thread_local int32 core_id = core_mask_id;
+	GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Emerald, FString::Printf(TEXT("core_mask_if: %d"), core_mask_id));
+	while (true)
+	{
+		while (NeedWaitOtherThreads.load() && !NeedCancelMultithreading.load())
+			_mm_pause();
+		{
+			std::unique_lock<std::mutex> WaitLock(BeginWaitingTaskMutexLock);
+			++BeginWaitingTaskNum;
+			if (MultithreadingTaskToDo == ECountRemainingLifeTime && BeginWaitingTaskNum == FPlatformMisc::NumberOfCores())
+			{
+				if (PrintLogWhenMultithreading)
+					GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Cyan, TEXT("MultithreadingTask::CountLife"));
+				FinishCountLifeCV.notify_one();
+			}
+			else if (MultithreadingTaskToDo == ECountBulletsLocationAndLevel && BeginWaitingTaskNum == FPlatformMisc::NumberOfCores())
+			{
+				FinishCountLocationAndLevelCV.notify_one();
+			}
+			WaitLock.unlock();
+			std::unique_lock<std::mutex> Lock(MultithreadingWaitMutexLock);
+			//wait期间自动释放MutexLock锁
+			RunMultithreadingCV.wait(Lock, [this](){return NeedMultithreadingHandleTask.load();});
+			Lock.unlock();
+		}
+		
+		if (NeedCancelMultithreading.load() == true)
+			break ;
+		
+		NeedWaitOtherThreads.store(true);
+		
+		if (MultithreadingTaskToDo == ECountRemainingLifeTime)
+		{
+			bool SetHasNewDeathElement = false;
+			int32 StartHandleIndex = CountLifeHelper[core_id].Key;
+			int32 NeedHandleFloatNum = CountLifeHelper[core_id].Value;
+			if (core_id == 0)
+			{
+				int32 ScalarNum = NeedHandleFloatNum % 8;
+				for (int32 i = 0 ; i < ScalarNum ; i++)
+				{
+					RemainingLifeTime[i] -= DeltaTime.load();
+					NeedDeleteMask[i] = RemainingLifeTime[i] <= 0 ? (SetHasNewDeathElement = true, 1) : 0;
+				}
+				for (; ScalarNum + 8 <= NeedHandleFloatNum ; ScalarNum += 8)
+				{
+					__m256 Life = _mm256_load_ps(&RemainingLifeTime[ScalarNum]);
+					__m256 Zero = _mm256_setzero_ps();
+					__m256 DeleteLife = _mm256_set1_ps(DeltaTime.load());
+					Life = _mm256_sub_ps(Life, DeleteLife);
+					_mm256_store_ps(&RemainingLifeTime[ScalarNum], Life);
+
+					int32 Mask = _mm256_movemask_ps(_mm256_cmp_ps(Life, Zero, _CMP_LE_OS));
+					for (int32 j = 0 ; j < 8 ; j++)
+					{
+						NeedDeleteMask[ScalarNum + j] = Mask & 1 << j ? (SetHasNewDeathElement = true, 1) : 0;
+					}
+				}
+				if (SetHasNewDeathElement)
+					HasNewDeathElement.store(true);
+				std::unique_lock<std::mutex> Lock(MultithreadingWaitMutexLock);
+				++FinishTaskNum;
+				if (FinishTaskNum.load() == (FPlatformMisc::NumberOfCores()))
+				{
+					NeedMultithreadingHandleTask.store(false);
+					NeedWaitOtherThreads.store(false);
+				}
+				Lock.unlock();
+				continue ;
+			}
+			if (core_id != FPlatformMisc::NumberOfCores() - 1)
+			{
+				for (int32 i = 0 ; i + 8 <= NeedHandleFloatNum ; i += 8)
+				{
+					__m256 Life = _mm256_loadu_ps(&RemainingLifeTime[StartHandleIndex + i]);
+					__m256 Zero = _mm256_setzero_ps();
+					__m256 DeleteLife = _mm256_set1_ps(DeltaTime.load());
+					Life = _mm256_sub_ps(Life, DeleteLife);
+					_mm256_storeu_ps(&RemainingLifeTime[StartHandleIndex + i], Life);
+				
+					int32 Mask = _mm256_movemask_ps(_mm256_cmp_ps(Life, Zero, _CMP_LE_OS));
+					for (int32 j = 0 ; j < 8 ; j++)
+					{
+						NeedDeleteMask[StartHandleIndex + i + j] = Mask & (1 << j) ? (SetHasNewDeathElement = true, 1) : 0;
+					}
+				}
+				if (SetHasNewDeathElement)
+					HasNewDeathElement.store(true);
+				std::unique_lock<std::mutex> Lock(MultithreadingWaitMutexLock);
+				++FinishTaskNum;
+				if (FinishTaskNum.load() == (FPlatformMisc::NumberOfCores()))
+				{
+					NeedMultithreadingHandleTask.store(false);
+					NeedWaitOtherThreads.store(false);
+				}
+				Lock.unlock();
+				continue ;
+			}
+			for (int32 i = 0 ; i + 8 <= NeedHandleFloatNum ; i += 8)
+			{
+				__m256 Life = _mm256_loadu_ps(&RemainingLifeTime[StartHandleIndex + i]);
+				__m256 Zero = _mm256_setzero_ps();
+				__m256 DeleteLife = _mm256_set1_ps(DeltaTime.load());
+				Life = _mm256_sub_ps(Life, DeleteLife);
+				_mm256_storeu_ps(&RemainingLifeTime[StartHandleIndex + i], Life);
+
+				int32 Mask = _mm256_movemask_ps(_mm256_cmp_ps(Life, Zero, _CMP_LE_OS));
+				for (int32 j = 0 ; j < 8 ; j++)
+					NeedDeleteMask[StartHandleIndex + i + j] = Mask & (1 << j) ? (SetHasNewDeathElement = true, 1) : 0;
+			}
+			int32 LastStartIndex = (EffectiveIndex.load() + 1) / 8 * 8;
+			for (int32 i = LastStartIndex ; i < EffectiveIndex.load() + 1 ; i++)
+			{
+				RemainingLifeTime[i] -= DeltaTime.load();
+				NeedDeleteMask[i] = RemainingLifeTime[i] <= 0 ? (SetHasNewDeathElement = true, 1) : 0;
+			}
+			if (SetHasNewDeathElement)
+				HasNewDeathElement.store(true);
+			std::unique_lock<std::mutex> Lock(MultithreadingWaitMutexLock);
+			++FinishTaskNum;
+			if (FinishTaskNum.load() == (FPlatformMisc::NumberOfCores()))
+			{
+				NeedMultithreadingHandleTask.store(false);
+				NeedWaitOtherThreads.store(false);
+			}
+			Lock.unlock();
+			continue ;
+		}
+
+		
+		if (MultithreadingTaskToDo == ECountBulletsLocationAndLevel)
+		{
+			if (core_id >= BulletWorldComponent.Num())
+			{
+				std::unique_lock<std::mutex> Lock(MultithreadingWaitMutexLock);
+				++FinishTaskNum;
+				if (FinishTaskNum.load() == FPlatformMisc::NumberOfCores())
+				{
+					NeedMultithreadingHandleTask.store(false);
+					NeedWaitOtherThreads.store(false);
+				}
+				Lock.unlock();
+				continue ;
+			}
+			//0,1,2,3
+			auto& BWC = BulletWorldComponent[core_id];
+			if (NewLevel[core_id].Num() < BWC.EffectiveIndex.load() + 1)
+				NewLevel[core_id].SetNum(BWC.EffectiveIndex.load() + 1);
+			__m256 TargetLocationX = _mm256_set1_ps(OriginLocationTarget->GetActorLocation().X);
+			__m256 TargetLocationY = _mm256_set1_ps(OriginLocationTarget->GetActorLocation().Y);
+			__m256 TargetLocationZ = _mm256_set1_ps(OriginLocationTarget->GetActorLocation().Z);
+			
+			for (int32 i = 0 ; i + 8 <= BWC.EffectiveIndex.load() + 1 ; i += 8)
+			{
+				int32 PerCacheLineCouldHandleFloatNum = std::hardware_destructive_interference_size / sizeof(float);
+				if (i + PerCacheLineCouldHandleFloatNum < BWC.EffectiveIndex.load() + 1 && i % PerCacheLineCouldHandleFloatNum == 0)
+				{
+					_mm_prefetch((const char*)&BWC.LocationX[i + PerCacheLineCouldHandleFloatNum], _MM_HINT_T0);
+					_mm_prefetch((const char*)&BWC.LocationY[i + PerCacheLineCouldHandleFloatNum], _MM_HINT_T0);
+					_mm_prefetch((const char*)&BWC.LocationZ[i + PerCacheLineCouldHandleFloatNum], _MM_HINT_T0);
+					_mm_prefetch((const char*)&BWC.SpeedX[i + PerCacheLineCouldHandleFloatNum], _MM_HINT_T0);
+					_mm_prefetch((const char*)&BWC.SpeedY[i + PerCacheLineCouldHandleFloatNum], _MM_HINT_T0);
+					_mm_prefetch((const char*)&BWC.SpeedZ[i + PerCacheLineCouldHandleFloatNum], _MM_HINT_T0);
+				}
+				
+				//更新位置
+				__m256 LX = _mm256_loadu_ps(&BWC.LocationX[i]);
+				__m256 LY = _mm256_loadu_ps(&BWC.LocationY[i]);
+				__m256 LZ = _mm256_loadu_ps(&BWC.LocationZ[i]);
+
+				__m256 SX = _mm256_loadu_ps(&BWC.SpeedX[i]);
+				__m256 SY = _mm256_loadu_ps(&BWC.SpeedY[i]);
+				__m256 SZ = _mm256_loadu_ps(&BWC.SpeedZ[i]);
+
+				__m256 Time = _mm256_set1_ps(DeltaTime.load());
+				LX = _mm256_fmadd_ps(Time, SX, LX);
+				LY = _mm256_fmadd_ps(Time, SY, LY);
+				LZ = _mm256_fmadd_ps(Time, SZ, LZ);
+				_mm256_storeu_ps(&BWC.LocationX[i], LX);
+				_mm256_storeu_ps(&BWC.LocationY[i], LY);
+				_mm256_storeu_ps(&BWC.LocationZ[i], LZ);
+				
+				//计算距离和Level
+				__m256 DX = _mm256_sub_ps(LX, TargetLocationX);
+				__m256 DY = _mm256_sub_ps(LY, TargetLocationY);
+				__m256 DZ = _mm256_sub_ps(LZ, TargetLocationZ);
+
+				__m256 DisSquare = _mm256_fmadd_ps(DX, DX, _mm256_fmadd_ps(DY, DY, _mm256_mul_ps(DZ, DZ)));
+				alignas(std::hardware_destructive_interference_size) float Dis[8];
+				_mm256_store_ps(Dis, DisSquare);
+
+				for (int32 j = 0 ; j < 8 ; j++)
+				{
+					NewLevel[core_id][i + j] = GetLevelByDisSquare(Dis[j]);
+				}
+			}
+			
+			int32 Index = (BWC.EffectiveIndex.load() + 1) / 8 * 8;
+			for (; Index <= BWC.EffectiveIndex.load(); Index++)
+			{
+				BWC.LocationX[Index] += BWC.SpeedX[Index] * DeltaTime.load();
+				BWC.LocationY[Index] += BWC.SpeedY[Index] * DeltaTime.load();
+				BWC.LocationZ[Index] += BWC.SpeedZ[Index] * DeltaTime.load();
+				float DisSquare = (BWC.LocationX[Index] - OriginLocationTarget->GetActorLocation().X) * (BWC.LocationX[Index] - OriginLocationTarget->GetActorLocation().X) +
+					(BWC.LocationY[Index] - OriginLocationTarget->GetActorLocation().Y) * (BWC.LocationY[Index] - OriginLocationTarget->GetActorLocation().Y)
+					 + (BWC.LocationZ[Index] - OriginLocationTarget->GetActorLocation().Z) * (BWC.LocationZ[Index] - OriginLocationTarget->GetActorLocation().Z);
+				NewLevel[core_id][Index] = GetLevelByDisSquare(DisSquare);
+			}
+			
+			std::unique_lock<std::mutex> Lock(MultithreadingWaitMutexLock);
+			++FinishTaskNum;
+			if (FinishTaskNum.load() == (FPlatformMisc::NumberOfCores()))
+			{
+				NeedMultithreadingHandleTask.store(false);
+				NeedWaitOtherThreads.store(false);
+			}
+			Lock.unlock();
+			
+			continue ;
+		}
+	}
+}
+
+
+void AHighPerformanceBullets::PrintArrayNumAndEffect()
+{
+	GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Red, FString::Printf(
+		TEXT("Controller::ArrayNum: %d, Effect: %d, BWC1::ArrayNum: %d, Effect: %d"),
+		RemainingLifeTime.Num(), EffectiveIndex.load(),
+		BulletWorldComponent[0].LocationX.Num(), BulletWorldComponent[0].EffectiveIndex.load()));
+	UE_LOG(LogTemp, Error, TEXT("Controller::ArrayNum: %d, Effect: %d, BWC1::ArrayNum: %d, Effect: %d"),
+		RemainingLifeTime.Num(), EffectiveIndex.load(), BulletWorldComponent[0].LocationX.Num(), BulletWorldComponent[0].EffectiveIndex.load())
+	EMPTY_LOG()
+}
+
+void AHighPerformanceBullets::LogAllControlInformation(bool LogLife, bool LogPointer, bool LogAll)
+{
+	if (LogPointer)
+		UE_LOG(LogTemp, Error, TEXT("BCEffectiveIndex: %d"), EffectiveIndex.load())
+	FString LifeTimeResult = TEXT("LifeArray: ");
+	FString MapToBWCResult = TEXT("MapToBWC: ");
+	for (int32 j = 0 ; j <= (LogAll ? RemainingLifeTime.Num() - 1 : EffectiveIndex.load()); j++)
+	{
+		LifeTimeResult += FString::Printf(TEXT("%.1f, "), RemainingLifeTime[j]);
+		FString PreMap = FString::Printf(TEXT("(%d, "), MapToBWC[j].Key);
+		PreMap += FString::Printf(TEXT("%d), "), MapToBWC[j].Value);
+		MapToBWCResult += PreMap;
+	}
+	FString BWC0Result = TEXT("BWC0: ");
+	for (int32 j = 0 ; j <= (LogAll ? BulletWorldComponent[0].LocationX.Num() - 1 : BulletWorldComponent[0].EffectiveIndex.load()); j++)
+		BWC0Result += FString::Printf(TEXT("%d, "), BulletWorldComponent[0].IndexInBC[j]);
+	BWC0Result += FString::Printf(TEXT("  BWC0::EffectiveIndex: %d"), BulletWorldComponent[0].EffectiveIndex.load());
+
+	FString BWC1Result = TEXT("WBC1: ");
+	for (int32 j = 0 ; j <= (LogAll ? BulletWorldComponent[1].LocationX.Num() - 1 : BulletWorldComponent[1].EffectiveIndex.load()); j++)
+		BWC1Result += FString::Printf(TEXT("%d, "), BulletWorldComponent[1].IndexInBC[j]);
+	BWC1Result += FString::Printf(TEXT("  BWC1::EffectiveIndex: %d"), BulletWorldComponent[1].EffectiveIndex.load());
+	
+	FString BWC2Result = TEXT("BWC2: ");
+	for (int32 j = 0 ; j <= (LogAll ? BulletWorldComponent[2].LocationX.Num() - 1 : BulletWorldComponent[2].EffectiveIndex.load()); j++)
+		BWC2Result += FString::Printf(TEXT("%d, "), BulletWorldComponent[2].IndexInBC[j]);
+	BWC2Result += FString::Printf(TEXT("  BWC2::EffectiveIndex: %d"), BulletWorldComponent[2].EffectiveIndex.load());
+	
+	FString BWC3Result = TEXT("BWC3: ");
+	for (int32 j = 0 ; j  <= (LogAll ? BulletWorldComponent[3].LocationX.Num() - 1 : BulletWorldComponent[3].EffectiveIndex.load()); j++)
+		BWC3Result += FString::Printf(TEXT("%d, "), BulletWorldComponent[3].IndexInBC[j]);
+	BWC3Result += FString::Printf(TEXT("  BWC3::EffectiveIndex: %d"), BulletWorldComponent[3].EffectiveIndex.load());
+
+	if (LogLife)
+		UE_LOG(LogTemp, Error, TEXT("%s"), *LifeTimeResult)
+	if(LogPointer)
+	{
+		UE_LOG(LogTemp, Error, TEXT("%s"), *MapToBWCResult)
+		UE_LOG(LogTemp, Error, TEXT("%s"), *BWC0Result)
+		UE_LOG(LogTemp, Error, TEXT("%s"), *BWC1Result)
+		UE_LOG(LogTemp, Error, TEXT("%s"), *BWC2Result)
+		UE_LOG(LogTemp, Error, TEXT("%s"), *BWC3Result)
+	}
+}
+
+bool AHighPerformanceBullets::CheckRankingIsValid()
+{
+	for (int32 i = 0 ; i < EffectiveIndex.load() + 1 ; i++)
+	{
+		auto& Pair = MapToBWC[i];
+		if (BulletWorldComponent[Pair.Key].EffectiveIndex.load() >= Pair.Value && BulletWorldComponent[Pair.Key].IndexInBC[Pair.Value] == i)
+			continue ;
+		UE_LOG(LogTemp, Error, TEXT("CheckRankingIsValid::Invalid"))
+		GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("CheckRankingIsValid::Invalid"));
+		return false;
+	}
+	return true;
+}
+
+bool AHighPerformanceBullets::CheckLevelIsValid()
+{
+	for (int32 i = 0 ; i < BulletWorldComponent.Num() ; i++)
+	{
+		auto& BWC = BulletWorldComponent[i];
+		for (int32 j = 0 ; j <= BWC.EffectiveIndex.load() ; j++)
+		{
+			float SquareDis = (BWC.LocationX[j] - OriginLocationTarget->GetActorLocation().X) * (BWC.LocationX[j] - OriginLocationTarget->GetActorLocation().X) +
+							  (BWC.LocationY[j] - OriginLocationTarget->GetActorLocation().Y) * (BWC.LocationY[j] - OriginLocationTarget->GetActorLocation().Y) +
+							  	(BWC.LocationZ[j] - OriginLocationTarget->GetActorLocation().Z) * (BWC.LocationZ[j] - OriginLocationTarget->GetActorLocation().Z);
+			if (GetLevelByDisSquare(SquareDis) == i)
+				continue ;
+			UE_LOG(LogTemp, Error, TEXT("CheckLevelIsValid::Invalid"));
+			EMPTY_LOG();
+			return false;
+		}
+	}
+	return true;
+}
+
+bool AHighPerformanceBullets::CheckInstancedIndexIsValid()
+{
+	FMemMark Mark(FMemStack::Get());
+	FMemStack& Stack = FMemStack::Get();
+	int32* AppearTimes = reinterpret_cast<int32*>(Stack.Alloc(sizeof(int32) * (EffectiveIndex.load() + 1), alignof(int32)));
+	FMemory::Memzero(AppearTimes, sizeof(int32) * (EffectiveIndex.load() + 1));
+	for (int32 i = 0 ; i <= EffectiveIndex.load(); i++)
+	{
+		if (AppearTimes[InstancedStaticMeshIndex[i]] == 1)
+		{
+			UE_LOG(LogTemp, Error, TEXT("ISMC's Index Wrong."))
+			GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("ISMC's Index Wrong."));
+			EMPTY_LOG();
+			return false;
+		}
+		AppearTimes[InstancedStaticMeshIndex[i]] = 1;
+	}
+	for (int32 i = 0 ; i <= EffectiveIndex.load(); i++)
+	{
+		if (AppearTimes[i] == 0)
+		{
+			UE_LOG(LogTemp, Error, TEXT("ISMC's Index Wrong."))
+			GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, TEXT("ISMC's Index Wrong."));
+			EMPTY_LOG();
+			return false;
+		}
+	}
+	return true;
+}
+
+void AHighPerformanceBullets::TestDeathGeneric()
+{
+	TArray<TTuple<int32, TArray<int32>>> a;
+	a.SetNum(BulletWorldComponent.Num());
+	for (int32 i = 0 ; i < BulletWorldComponent.Num() ; i++)
+	{
+		a[i].Key = i;
+		UE_LOG(LogTemp, Error, TEXT("Level: %d, BWC.EffectiveIndex: %d"), i, BulletWorldComponent[i].EffectiveIndex.load());
+		if (BulletWorldComponent[i].EffectiveIndex.load() == -1)
+			continue ;
+		
+		TArray<int32> b;
+		b = UFunctionLibrary::Range<int32>(BulletWorldComponent[i].EffectiveIndex.load() + 1);
+		int32 length = BulletWorldComponent[i].EffectiveIndex.load() + 1;
+		TArray<int32> result = UFunctionLibrary::GetRandomProperSubset<int32>(b, length, UKismetMathLibrary::RandomIntegerInRange(1, length));
+		for (auto index : result)
+		{
+			a[i].Value.Emplace(index);
+			UE_LOG(LogTemp, Error, TEXT("RemoveColumnIndex: %d"), index)
+		}
+	}
+	EMPTY_LOG();
+	HandleDeathElement_Generic(a);
+}
+
+void AHighPerformanceBullets::CountThreadAffinityMask()
+{
+#if IN_WIN64
+	DWORD BufferLength = 0;
+	GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &BufferLength);
+	PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX Buffer = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(malloc(BufferLength));
+	GetLogicalProcessorInformationEx(RelationProcessorCore, Buffer, &BufferLength);
+	if (Buffer == nullptr)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 10.0f, FColor::Red, FString::Printf(
+			TEXT("%s::GetLogicalProcessorInformationEx failed! Buffer Is Null"), TEXT(__FUNCTION__)));
+		return ;
+	}
+	auto info = Buffer;
+	BYTE* end = (BYTE*)info + BufferLength;
+	while ((BYTE*)info < end)
+	{
+		uint64_t Line = info->Processor.GroupMask[0].Mask;
+		ThreadAffinityMask.Emplace(_blsi_u64(Line));
+		info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)((BYTE*)info + info->Size);
+	}
+#endif
+}
+
+
+AHighPerformanceBullets::AHighPerformanceBullets(const FObjectInitializer& ObjectInitializer)
+{
+	PrimaryActorTick.bCanEverTick = true;
+	InstancedMesh = CreateDefaultSubobject<UMyISMC>(TEXT("InstancedMesh_Name"));
+	SetRootComponent(InstancedMesh);
+
+	ConstructorHelpers::FObjectFinder<UStaticMesh> Mesh(TEXT("/Script/Engine.StaticMesh'/Engine/EditorMeshes/EditorSphere.EditorSphere'"));
+	if (Mesh.Succeeded())
+		InstancedMesh->SetStaticMesh(Mesh.Object);
+	ConstructorHelpers::FObjectFinder<UMaterial> Material(TEXT("/Script/Engine.Material'/Engine/EngineDebugMaterials/BoneWeightMaterial.BoneWeightMaterial'"));
+	if (Material.Succeeded())
+		InstancedMesh->SetMaterial(0, Material.Object);
+
+	InstancedMesh->bDisableCollision = true;
+	InstancedMesh->SetCullDistance(Far);
+}
+
+AHighPerformanceBullets::~AHighPerformanceBullets()
+{
+#if USE_AVX2
+	NeedMultithreadingHandleTask.store(true);
+	NeedCancelMultithreading.store(true);
+	NeedWaitOtherThreads.store(false);
+	RunMultithreadingCV.notify_all();
+	for (auto& thread : CountingMultipleThreads)
+		if (thread.joinable())
+			thread.join();
+#endif
+}
+
+void AHighPerformanceBullets::BeginPlay()
+{
+	Super::BeginPlay();
+	
+	BulletWorldComponent.SetNum(4);
+	BulletWorldComponent[0].World = GetWorld();
+	BulletWorldComponent[0].SourceBC = this;
+	BulletWorldComponent[1].World = GetWorld();
+	BulletWorldComponent[1].SourceBC = this;
+	BulletWorldComponent[2].World = GetWorld();
+	BulletWorldComponent[2].SourceBC = this;
+	BulletWorldComponent[3].World = GetWorld();
+	BulletWorldComponent[3].SourceBC = this;
+	ThreadAffinityMask.Reserve(FPlatformMisc::NumberOfCores());
+
+	CountThreadAffinityMask();
+	for (int32 i = 0 ; i < FPlatformMisc::NumberOfCores() ; i++)
+	{
+		CountingMultipleThreads.Emplace([i, this]()
+		{
+			SetThreadAffinityMask(GetCurrentThread(), ThreadAffinityMask[i]);
+			HandleAnyBulletTaskForThread(i);
+		});
+	}
+	CountLifeHelper.SetNum(FPlatformMisc::NumberOfCores());
+	NewLevel.SetNum(BulletWorldComponent.Num());
+}
+
+#if 0
+auto PrintProcessorInformation = [&]()
+{
+	auto ProcessorNumber = GetCurrentProcessorNumber();
+	FString Information = FString::Printf(TEXT("ThreadId: %lu, "), GetThreadId(GetCurrentThread()));
+	Information += FString::Printf(TEXT("CPU Core: %lu, "), ProcessorNumber);
+	Information += FString::Printf(TEXT("ThreadAffinityMask: %llu"), ThreadAffinityMask[i]);
+	//GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Purple, *Information);
+};
+PrintProcessorInformation();
+#endif
+
+
+void AHighPerformanceBullets::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+	DeltaTime.store(DeltaSeconds);
+	CountRemainingLifeTime();
+	CountBulletsLocationAndLevel();
+	UpdateBulletsRendering();
+#if 0
+	if (EffectiveIndex.load() != -1)
+	{
+		CheckLevelIsValid();
+		CheckRankingIsValid();
+		CheckInstancedIndexIsValid();
+	}
+#endif
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

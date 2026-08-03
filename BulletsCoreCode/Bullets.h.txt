@@ -1,0 +1,485 @@
+#pragma once
+
+#include <condition_variable>
+#include <coroutine>
+#include <thread>
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "PublicAssistance/PublicAssistance.h"
+#include "Components/InstancedStaticMeshComponent.h"
+#include "ECSBullets.generated.h"
+
+class UInstancedStaticMeshComponent;
+
+//FPlatformMisc::HasAVX2InstructionSupport();
+#include <intrin.h>
+
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+	#define CPUID_X86_FAMILY 1
+#else
+	#define CPUID_X86_FAMILY 0
+#endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+	#define CPUID_ARM_NEON 1
+#else
+	#define CPUID_ARM_NEON 0
+#endif
+
+inline bool HasSSE41()
+{
+#if CPUID_ARM_NEON
+	return false;
+#endif
+	
+	int cpuInfo[4];
+#ifdef _MSC_VER
+	__cpuid(cpuInfo, 1);
+#else
+	__cpuid_count(1, 0, cpuInfo[0], cpuInfo[1], cpuInfo[2], cpuInfo[3]);
+#endif
+	// ECX bit 19 = SSE4.1
+	return (cpuInfo[2] & (1 << 19)) != 0;
+}
+
+inline bool HasAVX2()
+{
+#if CPUID_ARM_NEON
+	return false;
+#endif
+	
+	int cpuInfo[4];
+
+	// CPU最高支持的CPUID Leaf
+#ifdef _MSC_VER
+	__cpuid(cpuInfo, 0);
+#else
+	__cpuid_count(0, 0, cpuInfo[0], cpuInfo[1], cpuInfo[2], cpuInfo[3]);
+#endif
+	if (cpuInfo[0] < 7)[[unlikely]]//Leaf == 7 -> AVX2,AVX512
+		return false;
+
+	// 检查AVX和OSXSAVE
+	//返回EAX,EBX,ECX,EDX,  ECX: bit19->SSE4.1, bit20->SSE4.2, bit27->OSXSAVE, bit28->AVX
+#ifdef _MSC_VER
+	__cpuid(cpuInfo, 1);
+#else
+	__cpuid_count(1, 0, cpuInfo[0], cpuInfo[1], cpuInfo[2], cpuInfo[3]);
+#endif
+	const bool osUsesXSAVE = (cpuInfo[2] & (1 << 27)) != 0;
+	const bool cpuSupportsAVX = (cpuInfo[2] & (1 << 28)) != 0;
+
+	if (!osUsesXSAVE || !cpuSupportsAVX)
+		return false;
+
+	// Windows是否保存YMM寄存器
+	//获取XCR0, bit0->基础浮点,必须为1. bit1->XMM0~XMM15,必须为1. bit2->AVX
+#ifdef _MSC_VER
+	const unsigned long long xcr0 = _xgetbv(0);
+#else
+	const unsigned long long xcr0 = __builtin_ia32_xgetbv(0);
+#endif
+	if ((xcr0 & 0x6) != 0x6)
+		return false;
+
+	//Leaf7 EBX 的subLeaf0中的bit5->AVX2
+#ifdef _MSC_VER
+	__cpuidex(cpuInfo, 7, 0);
+#else
+	__cpuid_count(7, 0, cpuInfo[0], cpuInfo[1], cpuInfo[2], cpuInfo[3]);
+#endif
+	return (cpuInfo[1] & (1 << 5)) != 0;
+}
+
+
+//第三版
+
+class AHighPerformanceBullets;
+using BulletsController = AHighPerformanceBullets;
+
+UCLASS(ClassGroup = Rendering, meta = (BlueprintSpawnableComponent), Blueprintable, MinimalAPI)
+class UMyISMC : public UInstancedStaticMeshComponent
+{
+	GENERATED_BODY()
+
+public:
+};
+
+//子弹主体.目前只作为学习,所以只列下面几个属性.真正情况可能还要添加额外属性
+struct alignas(sizeof(void*)) BulletEntity
+{
+	double Damage = 5;
+	void Destroy(){};
+};
+
+class BulletPool
+{
+private:
+	struct InsidePtr
+	{
+		InsidePtr* Next;
+	};
+
+	//指向当前可用区域
+	InsidePtr* AvailableSpace = nullptr;
+	//记录开辟的每块空间的头位置
+	TArray<void*> Blocks;//void* Blocks[];
+	void ExpandSpace();
+public:
+	BulletEntity* Allocate();
+	void Reallocate(BulletEntity* GivebackSpace);
+public:
+	BulletPool() = default;
+	~BulletPool();
+};
+
+
+struct BulletWorldComponent;
+
+struct OuterCoroutine
+{
+	struct promise_type
+	{
+		std::suspend_never  initial_suspend() noexcept {return {};}
+		std::suspend_never  final_suspend() noexcept {return {};}
+		 void  unhandled_exception()  noexcept {}
+		OuterCoroutine get_return_object()
+		{
+			return OuterCoroutine{};
+		}
+		void return_void(){};
+		//void return_value(T  value)//T是co_return跟的.后面的值类型。在return_value里面保存值
+	};
+};
+
+
+struct InnerCoroutineForBWC
+{
+	bool await_ready() noexcept {return false;}
+	void await_suspend(std::coroutine_handle<> coroutine) noexcept
+	{
+		auto Shared = std::make_shared<PollStateForBWC>();
+		Shared->BulletsComponent = BulletsComponent;
+		Shared->handle = std::move(coroutine);
+		Shared->World = World;
+		HandleArray(Shared);
+	}
+	void await_resume() noexcept {}
+
+	InnerCoroutineForBWC() {};
+	InnerCoroutineForBWC(BulletWorldComponent* Tt, UWorld* _World)
+	{
+		BulletsComponent = Tt;
+		World = _World;
+	}
+private:
+
+	UWorld* World = nullptr;
+	BulletWorldComponent* BulletsComponent = nullptr;
+	struct PollStateForBWC
+	{
+		std::coroutine_handle<> handle;
+		BulletWorldComponent* BulletsComponent;
+		UWorld* World;
+		FTimerHandle TimerHandle;
+	};
+
+	void HandleArray(std::shared_ptr<PollStateForBWC> State);
+};
+
+struct BulletWorldComponent
+{
+	TArray<float> LocationX;
+	TArray<float> LocationY;
+	TArray<float> LocationZ;
+	TArray<float> SpeedX;
+	TArray<float> SpeedY;
+	TArray<float> SpeedZ;
+	TArray<int32> IndexInBC;
+	//当某些子弹死亡的时候,我并不希望马上对数组大小进行修改,只设置一个EffectiveIndex作为有效位表示当前数组从[0, EffectiveIndex]的数据是存活的
+	std::atomic<int32> EffectiveIndex{-1};
+	TObjectPtr<AHighPerformanceBullets> SourceBC = nullptr;
+
+	BulletWorldComponent(){};
+	BulletWorldComponent(float _RegularInspectionTime, UWorld* _World)
+	{
+		RegularInspectionTime = _RegularInspectionTime >= 5.f ? _RegularInspectionTime : 5.f;
+		World = _World;
+	};
+
+	//只在主线程调用
+	void AddNewBulletComponent(int32 AddNum, const FVector& SpawnLocation, float SpawnRandomDeviation, float MinSpeed, float MaxSpeed)
+	{
+		RegularHandleArraySize();
+		check(AddNum >= 0);
+		if (LocationX.Num() < EffectiveIndex.load() + AddNum + 1)[[likely]]
+		{
+			LocationX.SetNum((EffectiveIndex.load() + AddNum + 1) * 5);
+			LocationY.SetNum((EffectiveIndex.load() + AddNum + 1) * 5);
+			LocationZ.SetNum((EffectiveIndex.load() + AddNum + 1) * 5);
+			SpeedX.SetNum((EffectiveIndex.load() + AddNum + 1) * 5);
+			SpeedY.SetNum((EffectiveIndex.load() + AddNum + 1) * 5);
+			SpeedZ.SetNum((EffectiveIndex.load() + AddNum + 1) * 5);
+			IndexInBC.SetNum((EffectiveIndex.load() + AddNum + 1) * 5);
+		}
+		SpawnRandomDeviation = SpawnRandomDeviation >= 0 ? SpawnRandomDeviation : -SpawnRandomDeviation;
+		
+		for (int32 i = 0; i < AddNum; i++)
+		{
+			ReplaceAt(EffectiveIndex.load() + 1 + i, SpawnLocation, SpawnRandomDeviation, MinSpeed, MaxSpeed);
+		}
+		EffectiveIndex += AddNum;
+	}
+
+
+
+public:
+	//最近一次修改数组有效标志位的大小,用于定期检测数组缩容
+	std::atomic<float> LastTimeChangeArrayEffectiveFlag{0.f};
+	//每隔多久定期检测一次
+	float RegularInspectionTime{60.f};
+	FCriticalSection CriticalSection;
+	UWorld* World = nullptr;
+
+	//只在线程池调用
+	void ResetAllArraySize(int32 NewSize)
+	{
+		FScopeLock Lock(&CriticalSection);
+		LocationX.SetNum(NewSize);
+		LocationY.SetNum(NewSize);
+		LocationZ.SetNum(NewSize);
+		SpeedX.SetNum(NewSize);
+		SpeedY.SetNum(NewSize);
+		SpeedZ.SetNum(NewSize);
+		IndexInBC.SetNum(NewSize);
+	}
+
+	OuterCoroutine RegularHandleArraySize()
+	{
+		LastTimeChangeArrayEffectiveFlag.store(World->GetTimeSeconds());
+		InnerCoroutineForBWC Handle(this, World);
+		co_await Handle;
+		co_return;
+	}
+private:
+	inline void ReplaceAt(int32 Index, const FVector& SpawnLocation, float SpawnRandomDeviation, float MinSpeed, float MaxSpeed);
+};
+
+
+
+
+//用于处理BC里面的对其数组
+struct InnerCoroutineForBC
+{
+	bool await_ready(){return false;}
+	void await_suspend(std::coroutine_handle<> handle)
+	{
+		auto Share = std::make_shared<PollStatForBC>();
+		Share->handle = std::move(handle);
+		Share->SourceController = SourceController;
+		Share->World = World;
+		HandleArray(Share);
+	}
+	void await_resume(){}
+
+	InnerCoroutineForBC(){}
+	InnerCoroutineForBC(AHighPerformanceBullets* From, UWorld* _World): SourceController(From), World(_World){};
+private:
+	struct PollStatForBC
+	{
+		std::coroutine_handle<> handle;
+		AHighPerformanceBullets* SourceController;
+		UWorld* World;
+		FTimerHandle TimerHandle;
+	};
+	AHighPerformanceBullets* SourceController = nullptr;
+	UWorld* World = nullptr;
+	void HandleArray(std::shared_ptr<PollStatForBC> State);
+};
+
+UCLASS()
+class AHighPerformanceBullets : public AActor
+{
+	GENERATED_BODY()
+
+	friend InnerCoroutineForBC;
+public:
+	BulletPool BulletPool;//24
+
+	//需要同步处理的BC对其数组
+
+	///////////////////////////////////////////////////////////////////////
+	TArray<int32> InstancedStaticMeshIndex;//16
+	TArray<BulletEntity*> Bullets;//16
+	TArray<float> RemainingLifeTime;//16
+	//MapToBWC[i].Key == BulletWorldComponent[j]
+	//MapToBWC[i].Vale == BulletWorldComponent[j].Index
+	TArray<TTuple<int32, int32>> MapToBWC;
+	//BulletWorldComponent[i].IndexInBC[j] == MapToBWC[Index]
+	/////////////////////////////////////////////////////////////////////////
+	
+	TArray<BulletWorldComponent> BulletWorldComponent;
+
+	std::atomic<int32> EffectiveIndex{-1};
+	
+	
+	UPROPERTY()
+	UMyISMC* InstancedMesh;
+
+	UPROPERTY(BlueprintReadWrite)
+	TObjectPtr<AActor> OriginLocationTarget = nullptr;
+	
+	std::atomic<float> DeltaTime{0.f};
+
+	UPROPERTY(BlueprintReadWrite)
+	bool PrintLogWhenMultithreading = false;
+
+	//当子弹超出最远渲染距离的时候，子弹的渲染实例就永远的被留在了当前位置，即使实际上子弹的位置已经很远很远了.此时如果该值为true,就会
+	//保留Limit层级的渲染.如果为false则不保留
+	UPROPERTY(BlueprintReadWrite)
+	bool DrawResidue = true;//150
+	//ECSBullets.generated.h
+	//HighPerformanceBullets , Actor
+	//DrawResidue, bool, 150   反射
+	//Exec
+private:
+	//生命剩余时间、子弹位置依旧需要实时计算,这是为了模拟碰撞.
+	
+	/////////////////////////////////////////////////////
+	//进距离,实时更新所有渲染
+	float Close = 1000.f;
+	//中距离,每帧渲染MiddleRenderingNum颗子弹
+	float Middle = 2000.f;
+	//远距离,每帧渲染FarRenderingNum颗子弹
+	float Far = 3000.f;
+	//极限距离.超过该距离直接不进行渲染.这里数据无效,因为大于Far的统一视为Limit
+	float Limit = -1;
+	
+	int32 MiddleRenderingNum = 200;
+	int32 FarRenderingNum = 100;
+	int32 MiddleRenderingIndex = 0;
+	int32 FarRenderingIndex = 0;
+	
+	int32 GetLevelByDisSquare(float DisSquare)
+	{
+		if (DisSquare <= Close * Close)
+			return 0;
+		if (DisSquare <= Middle * Middle)
+			return 1;
+		if (DisSquare <= Far * Far)
+			return 2;
+		return 3;
+	}
+
+	TArray<TArray<int32>> NewLevel;
+	std::atomic<float> LastTimeChangeArrayEffectiveFlag{0.f};
+	std::atomic<float> RegularInspectionTime{60.f};
+	TArray<int32> NeedDeleteMask;
+	TArray<uint64_t> ThreadAffinityMask;
+public:
+
+	UFUNCTION(BlueprintCallable)
+	[[maybe_unused]]void SetThreeDistances(float _Close, float _Middle, float _Far);
+	UFUNCTION(BlueprintCallable)
+	[[maybe_unused]]void SetUpdateRenderingNum(int32 _MiddleNum, int32 _FarNum);
+
+	void ResetAllArraySize(int32 Size);
+	
+	UFUNCTION(BlueprintCallable)
+	void SpawnBullets(int32 SpawnNum, UPARAM(ref) FVector& SpawnLocation, float SpawnRandomDeviation, float MinSpeed, float MaxSpeed, float OriginalLifeTime, int32 Level);
+	
+	void HandleDeathElement_Life();
+	//第一个参数表示BWC[i],第二个参数表示死亡的元素在BWC[i]里面的Index
+	void HandleDeathElement_Generic(TArray<TTuple<int32, TArray<int32>>>& DeathElement, bool UsingSwap = false);
+	
+	void CountRemainingLifeTime();
+
+	//实时更新所有的子弹的位置以及属于哪一个层级的BWC
+	void CountBulletsLocationAndLevel();
+	
+	void UpdateBulletsRendering();
+
+	UFUNCTION(BlueprintCallable)
+	void PrintArrayNumAndEffect();
+
+	//打印所有跟对齐、指向相关的信息
+	UFUNCTION(BlueprintCallable)
+	void LogAllControlInformation(bool LogLife = true, bool LogPointer = true, bool LogAll = false);
+	
+	inline bool CheckRankingIsValid();
+	inline bool CheckLevelIsValid();
+	inline bool CheckInstancedIndexIsValid();
+
+	UFUNCTION(BlueprintCallable)
+	void TestDeathGeneric();
+
+	void CountThreadAffinityMask();
+private:
+	OuterCoroutine RegularHandleArray()
+	{
+		InnerCoroutineForBC InnerCoroutine(this, GetWorld());
+		co_await InnerCoroutine;
+		co_return;
+	}
+#if USE_AVX2
+	enum EMultithreadingTaskToDo
+	{
+		ECountRemainingLifeTime,
+		ECountBulletsLocationAndLevel,
+	};
+	EMultithreadingTaskToDo MultithreadingTaskToDo = ECountRemainingLifeTime;
+	//用于辅助多线程计算RemainingLifeTime.第一个参数表示要从哪个Index开始计算.第二个参数表示当前线程要处理多少元素
+	TArray<TTuple<int32, int32>> CountLifeHelper;
+	std::atomic<bool> NeedMultithreadingHandleTask{false};
+	std::atomic<bool> NeedCancelMultithreading{false};
+	void HandleAnyBulletTaskForThread(int32 core_mask_id);
+	TArray<std::thread> CountingMultipleThreads;
+	std::mutex MultithreadingWaitMutexLock;
+	std::condition_variable RunMultithreadingCV;
+
+	//用于表示每次计算完子弹剩余存活时间之后检查是否有新元素死亡
+	std::atomic<bool> HasNewDeathElement{false};
+	std::condition_variable FinishCountLifeCV;
+	std::mutex FinishCountLifeMutexLock;
+
+	//CountLocationAndLevel
+	std::mutex FinishCountLocationMutexLock;
+	std::condition_variable FinishCountLocationAndLevelCV;
+
+	std::atomic_int FinishTaskNum{0};
+	std::atomic_int BeginWaitingTaskNum{0};
+	std::mutex BeginWaitingTaskMutexLock;
+	std::atomic<bool> NeedWaitOtherThreads{false};
+#endif
+	
+public:
+	AHighPerformanceBullets(const FObjectInitializer& ObjectInitializer);
+	virtual ~AHighPerformanceBullets() override;
+	virtual void BeginPlay() override;
+	virtual void Tick(float DeltaSeconds) override;
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
